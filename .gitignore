@@ -21,7 +21,6 @@ dist-ssr
 .dev.vars
 
 # Editor directories and files
-.vscode/*
 !.vscode/extensions.json
 .idea
 .DS_Store
@@ -32,7 +31,6 @@ dist-ssr
 *.sw?
 
 # Environment
-.env
-.env.*
 !.env.example
 .vercel
+config.bat
