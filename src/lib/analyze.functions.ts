@@ -1,0 +1,564 @@
+import { createServerFn } from "@tanstack/react-start";
+import { z } from "zod";
+
+import type { AiProvider } from "./ai-provider.server";
+
+const MAX_IMAGE_CHARS = 3_000_000;
+
+const Input = z.object({
+  images: z
+    .array(
+      z
+        .string()
+        .min(20)
+        .max(MAX_IMAGE_CHARS)
+        .regex(/^data:image\/[a-zA-Z0-9.+-]+;base64,/),
+    )
+    .min(1)
+    .max(3),
+});
+
+// Best-effort per-instance rate limit. Serverless instances don't share memory,
+// so this blunts casual abuse only; put a real limiter (e.g. Cloudflare rules)
+// in front of the endpoint for hard guarantees.
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX = 8;
+const hits = new Map<string, number[]>();
+
+function clientKey(request: Request | undefined): string {
+  const h = request?.headers;
+  return (
+    h?.get("cf-connecting-ip") ?? h?.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown"
+  );
+}
+
+function checkRateLimit(key: string): boolean {
+  const now = Date.now();
+  const recent = (hits.get(key) ?? []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (recent.length >= RATE_MAX) {
+    hits.set(key, recent);
+    return false;
+  }
+  recent.push(now);
+  hits.set(key, recent);
+  if (hits.size > 5000) {
+    for (const [k, v] of hits) if (v.every((t) => now - t >= RATE_WINDOW_MS)) hits.delete(k);
+  }
+  return true;
+}
+
+export type ClaimCheck = {
+  claim: string;
+  reality: string;
+  verdict: "true" | "misleading" | "false";
+};
+
+export type AnalysisResult = {
+  isFoodLabel: boolean;
+  productName: string;
+  category: string;
+  verdict: "healthy" | "moderate" | "unhealthy";
+  pcRatio: number;
+  pcExplanation: string;
+  trustScore: number;
+  trustExplanation: string;
+  confidence: "low" | "medium" | "high";
+  confidenceExplanation: string;
+  legibility: string[];
+  ingredients?: string[];
+  claims: ClaimCheck[];
+  redFlags: string[];
+  greenFlags: string[];
+  summary: string;
+};
+
+// Stage 1: a deliberately tiny, thinking-disabled classifier. Its only job is
+// yes/no — is this actually a packaged food photo — so a non-food photo can
+// be rejected in well under a second instead of paying for the full,
+// variable-length analysis pass below.
+const GATE_SYSTEM = `You are a fast image classifier. You are given one to three photos.
+Decide isFoodLabel: true only if at least one photo clearly shows a packaged food product — front-of-pack branding, an ingredient list, or a nutrition panel. Set it false for anything else: people, pets, scenery, unrelated objects, screenshots, blank or unreadable images, etc.
+If false, write one short, friendly sentence in "note" describing what the photo actually shows and asking for a photo of the product instead. If true, "note" can be an empty string.
+Do not analyse nutrition or claims here — this is only a yes/no gate. Reply with JSON only: {"isFoodLabel": boolean, "note": string}.`;
+
+const gateSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    isFoodLabel: { type: "boolean" },
+    note: { type: "string" },
+  },
+  required: ["isFoodLabel", "note"],
+};
+
+// Stage 2: the full audit. Only ever called once the gate has already
+// confirmed the photo is a packaged food product.
+const SYSTEM = `You are a meticulous food label auditor. You receive one to three photos of the SAME packaged food item (front of pack, ingredient list, and/or nutrition panel). This has already been confirmed to be a packaged food product.
+
+WORK IN THIS ORDER, silently, before answering:
+1. TRANSCRIBE what you can actually read: product name, net weight, serving size, servings per pack, and every nutrition value with its unit and basis (per 100g vs per serving). Read the ingredient list in order.
+2. NORMALISE all nutrition figures to per 100g/100ml so comparisons are fair. If only per-serving values are printed, convert using the printed serving size and say so.
+3. CHECK for the classic tricks: unrealistically small serving size, "per piece" bases, added-sugar synonyms (glucose syrup, maltodextrin, invert syrup, fruit juice concentrate, dextrose), protein claims met by low-quality or tiny amounts, "no added sugar" with high total sugar, palm/hydrogenated fat, high sodium, long additive lists, "natural"/"immunity"/"multigrain" halos with refined flour first, fortification used to distract from a poor base.
+4. Only THEN score.
+
+SCORING RULES
+- pcRatio (Product-to-Claim ratio, 0.00-2.00): how far the product's real nutrition and ingredients deliver on the pack's own claims. 1.00 = fully lives up to the claims. Below 1.00 = the marketing over-promises. Above 1.00 = genuinely better than advertised. Anchor it: a pack with several misleading claims and refined/high-sugar composition lands 0.3-0.6; one honest minor stretch lands 0.85-0.95; a plain pack with strong nutrition lands 1.1-1.4. If a pack makes NO claims, judge it against the implicit claim of its category and say so.
+- trustScore (0-100): how much a shopper should trust this pack's messaging, given the gap between claims and ingredients, serving-size games, hidden sugars and additive load.
+- verdict: healthiness of eating this regularly.
+- claims: every front-of-pack claim you can actually see, each with the concrete ingredient/nutrition reality and a verdict.
+- confidence: "high" only when the ingredient list AND nutrition panel are legible; "medium" when one is partly readable or values are inferred; "low" when you are mostly working from the front of pack, blur, glare or a crop.
+- confidenceExplanation: one or two sentences naming exactly what was and was not legible and what that means for the scores.
+- ingredients: the ingredient list exactly as printed, in order, one string per ingredient (empty array if the list is not visible).
+- legibility: short bullet strings for what you could/could not read (e.g. "Nutrition panel readable per 100g", "Ingredient list cut off after item 6").
+
+HARD RULES
+- Never invent a number. If a value is not visible, write "not visible" instead of guessing, and lower confidence.
+- Quote real ingredient names and real figures you read.
+Reply with JSON only.`;
+
+const schema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    productName: { type: "string" },
+    category: { type: "string" },
+    verdict: { type: "string", enum: ["healthy", "moderate", "unhealthy"] },
+    pcRatio: { type: "number" },
+    pcExplanation: { type: "string" },
+    trustScore: { type: "number" },
+    trustExplanation: { type: "string" },
+    confidence: { type: "string", enum: ["low", "medium", "high"] },
+    confidenceExplanation: { type: "string" },
+    legibility: { type: "array", items: { type: "string" } },
+    ingredients: { type: "array", items: { type: "string" } },
+    claims: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          claim: { type: "string" },
+          reality: { type: "string" },
+          verdict: { type: "string", enum: ["true", "misleading", "false"] },
+        },
+        required: ["claim", "reality", "verdict"],
+      },
+    },
+    redFlags: { type: "array", items: { type: "string" } },
+    greenFlags: { type: "array", items: { type: "string" } },
+    summary: { type: "string" },
+  },
+  required: [
+    "productName",
+    "category",
+    "verdict",
+    "pcRatio",
+    "pcExplanation",
+    "trustScore",
+    "trustExplanation",
+    "confidence",
+    "confidenceExplanation",
+    "legibility",
+    "ingredients",
+    "claims",
+    "redFlags",
+    "greenFlags",
+    "summary",
+  ],
+};
+
+function retryDelayMs(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get("retry-after");
+  const seconds = retryAfter ? Number(retryAfter) : Number.NaN;
+  const delaySeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 1.5 ** (attempt + 1);
+  return Math.min(delaySeconds, 8) * 1000;
+}
+
+const AI_REQUEST_TIMEOUT_MS = 45_000;
+
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("The scanner timed out waiting on the AI service. Please try again.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function requestWithBoundedRetry(url: string, init: RequestInit): Promise<Response> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await fetchWithTimeout(url, init);
+    if (response.status !== 429 && response.status < 500) return response;
+    if (attempt === 1) return response;
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs(response, attempt)));
+  }
+
+  throw new Error("The scanner could not reach the AI service.");
+}
+
+function errorMessageFromBody(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw) as {
+      error?: { message?: string };
+      errors?: { message?: string }[];
+    };
+    return parsed.error?.message ?? parsed.errors?.[0]?.message ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function stripCodeFence(content: string): string {
+  const cleaned = content
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
+
+  // Some smaller/weaker models answer in natural language despite explicit
+  // "JSON only" instructions (e.g. "The image shows a bag of chips... {...}").
+  // If the cleaned text isn't already a bare JSON object, extract the
+  // substring between the first { and last } rather than failing outright.
+  if (cleaned.startsWith("{") && cleaned.endsWith("}")) return cleaned;
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) return cleaned.slice(start, end + 1);
+  return cleaned;
+}
+
+function imagePart(dataUrl: string) {
+  const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/);
+  if (!match) throw new Error("One of the uploaded photos could not be read.");
+  return { inlineData: { mimeType: match[1], data: match[2] } };
+}
+
+type ThinkingEffort = "none" | "light";
+
+function buildThinkingConfig(model: string, effort: ThinkingEffort): Record<string, unknown> {
+  // Gemini 3.x replaced thinkingBudget (a token count) with thinkingLevel
+  // (minimal/low/medium/high). Sending thinkingBudget to a 3.x model is
+  // rejected as an invalid argument - and 3.x Flash/Flash-Lite models don't
+  // support fully disabling thinking, so "none" maps to the lowest level
+  // rather than an actual off switch.
+  if (/^gemini-3/.test(model)) {
+    return { thinkingLevel: effort === "none" ? "minimal" : "low" };
+  }
+  return { thinkingBudget: effort === "none" ? 0 : 512 };
+}
+
+type CallOptions = {
+  system: string;
+  userText: string;
+  images: string[];
+  maxOutputTokens: number;
+  thinkingEffort: ThinkingEffort;
+  schemaName: string;
+  schema: unknown;
+};
+
+type WorkersAiBinding = {
+  run: (model: string, inputs: Record<string, unknown>) => Promise<unknown>;
+};
+
+function getWorkersAiBinding(): WorkersAiBinding | undefined {
+  const g = globalThis as unknown as {
+    __env__?: { AI?: WorkersAiBinding };
+    env?: { AI?: WorkersAiBinding };
+  };
+  return g.__env__?.AI ?? g.env?.AI;
+}
+
+const WORKERS_AI_TIMEOUT_MS = 45_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(onTimeout)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+/**
+ * Workers AI's OpenAI-compatible endpoint for this model is undocumented and
+ * unreliable for image input (Cloudflare's own sample code for this exact
+ * model is a known-broken open issue: cloudflare/cloudflare-docs#19185). The
+ * one pattern their own tutorial actually demonstrates working is the raw
+ * binding with a single image as a plain byte array - so that's what this
+ * uses, which also means only the first photo is analysed on this provider.
+ */
+async function callWorkersAiBinding(opts: CallOptions): Promise<string> {
+  const ai = getWorkersAiBinding();
+  if (!ai) {
+    throw new Error(
+      '[workers-ai] No Workers AI binding found. In this Worker\'s Settings -> Bindings, add a Workers AI binding named "AI".',
+    );
+  }
+
+  const match = opts.images[0]?.match(/^data:([^;,]+);base64,(.+)$/);
+  const base64Data = match?.[2];
+  if (!base64Data) throw new Error("[workers-ai] One of the uploaded photos could not be read.");
+  const imageBytes = Array.from(Buffer.from(base64Data, "base64"));
+
+  let result: unknown;
+  try {
+    result = await withTimeout(
+      ai.run("@cf/meta/llama-3.2-11b-vision-instruct", {
+        prompt: `${opts.system}\n\n${opts.userText}\n\n(Only one photo is provided in this request.)\n\nIMPORTANT: Your entire response must be a single valid JSON object and nothing else - no preamble, no explanation, no markdown code fences, no text before or after the JSON. Start your response with { and end with }.`,
+        image: imageBytes,
+        max_tokens: opts.maxOutputTokens,
+      }),
+      WORKERS_AI_TIMEOUT_MS,
+      "[workers-ai] The scanner timed out waiting on Workers AI. Please try again.",
+    );
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("[workers-ai]")) throw err;
+    throw new Error(`[workers-ai] ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  const r = result as { response?: unknown; result?: { response?: unknown } };
+  const rawContent = typeof result === "string" ? result : (r?.response ?? r?.result?.response);
+  if (rawContent === undefined || rawContent === null || rawContent === "") {
+    throw new Error("[workers-ai] The scanner returned an empty result.");
+  }
+  // Workers AI auto-parses a JSON reply into an object, so accept both shapes.
+  if (typeof rawContent === "object") return JSON.stringify(rawContent);
+  if (typeof rawContent !== "string") {
+    throw new Error("[workers-ai] Unexpected response shape from the AI service.");
+  }
+  return rawContent;
+}
+
+async function callAi(provider: AiProvider, opts: CallOptions): Promise<string> {
+  if (provider.name === "workers-ai") {
+    return callWorkersAiBinding(opts);
+  }
+
+  const body =
+    provider.transport === "gemini-content"
+      ? {
+          systemInstruction: { parts: [{ text: opts.system }] },
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: opts.userText }, ...opts.images.map(imagePart)],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.15,
+            responseMimeType: "application/json",
+            maxOutputTokens: opts.maxOutputTokens,
+            // Gemini's thinking-capable models default to an unbounded/dynamic
+            // thinking allowance, which can silently burn many seconds before
+            // it even starts the JSON answer (and can crowd out the real
+            // output entirely). Keeping this bounded keeps latency predictable.
+            thinkingConfig: buildThinkingConfig(provider.model, opts.thinkingEffort),
+          },
+        }
+      : {
+          model: provider.model,
+          temperature: 0.15,
+          max_tokens: opts.maxOutputTokens,
+          messages: [
+            { role: "system", content: opts.system },
+            {
+              role: "user",
+              content: [
+                { type: "text" as const, text: opts.userText },
+                ...opts.images.map((url) => ({
+                  type: "image_url" as const,
+                  image_url: { url },
+                })),
+              ],
+            },
+          ],
+          ...(provider.supportsStrictJsonSchema
+            ? {
+                response_format: {
+                  type: "json_schema",
+                  json_schema: { name: opts.schemaName, strict: true, schema: opts.schema },
+                },
+              }
+            : {}),
+        };
+
+  const res = await requestWithBoundedRetry(provider.url, {
+    method: "POST",
+    headers: provider.headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const raw = await res.text();
+    const providerMessage = errorMessageFromBody(raw);
+    const tag = `[${provider.name}]`;
+    if (res.status === 429) {
+      if (provider.name === "gemini") {
+        throw new Error(
+          `${tag} ${providerMessage ?? "Gemini temporarily rate-limited the scanner. Check the Google AI Studio quota for this key, then try again."}`,
+        );
+      }
+      throw new Error(
+        `${tag} ${providerMessage ?? "The AI service is busy after a retry. Please try again shortly."}`,
+      );
+    }
+    if (res.status === 401 || res.status === 403) {
+      if (provider.name === "gemini") {
+        throw new Error(
+          `${tag} ${providerMessage ?? "Gemini rejected this key. Check that the Generative Language API is enabled and that the Cloudflare secret is named GEMINI_API_KEY."}`,
+        );
+      }
+      throw new Error(`${tag} ${providerMessage ?? "The configured AI key was rejected."}`);
+    }
+    if (res.status === 402)
+      throw new Error(`${tag} AI credits exhausted. Add credits to keep scanning.`);
+    throw new Error(`${tag} ${providerMessage ?? `Scan failed (${res.status}).`}`);
+  }
+
+  const json = (await res.json()) as {
+    choices?: { message?: { content?: string | { text?: string }[] } }[];
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
+  };
+  const openAiContent = json.choices?.[0]?.message?.content;
+  const content =
+    provider.transport === "gemini-content"
+      ? json.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("")
+      : typeof openAiContent === "string"
+        ? openAiContent
+        : openAiContent?.map((part) => part.text ?? "").join("");
+  if (!content) throw new Error(`[${provider.name}] The scanner returned an empty result.`);
+  return content;
+}
+
+function neutralNonFoodResult(note: string): AnalysisResult {
+  return {
+    isFoodLabel: false,
+    productName: "Not a packaged food",
+    category: "",
+    verdict: "moderate",
+    pcRatio: 0,
+    pcExplanation: "",
+    trustScore: 0,
+    trustExplanation: "",
+    confidence: "low",
+    confidenceExplanation: "",
+    legibility: [],
+    claims: [],
+    redFlags: [],
+    greenFlags: [],
+    summary:
+      note ||
+      "This doesn't look like a packaged food product. Try again with a clear photo of the front of pack, ingredient list or nutrition panel.",
+  };
+}
+
+export const analyzeLabel = createServerFn({ method: "POST" })
+  .validator((input: unknown) => {
+    const parsed = Input.safeParse(input);
+    if (!parsed.success) {
+      throw new Error("Please send 1 to 3 photos (JPEG or PNG), each under about 2 MB.");
+    }
+    return parsed.data;
+  })
+  .handler(async ({ data }): Promise<AnalysisResult> => {
+    const { getRequest } = await import("@tanstack/react-start/server");
+    if (!checkRateLimit(clientKey(getRequest()))) {
+      throw new Error("Too many scans in a short time. Please wait a minute and try again.");
+    }
+
+    try {
+      const { resolveAiProvider } = await import("./ai-provider.server");
+      const provider = resolveAiProvider();
+
+      // Stage 1: fast gate. No thinking, tiny output — this is what keeps
+      // non-food photos fast and consistent instead of riding the same
+      // variable-length path as a real label audit.
+      const gateContent = await callAi(provider, {
+        system: GATE_SYSTEM,
+        userText: `Look at ${data.images.length} photo(s). Is at least one of them a packaged food product? Reply with JSON only.`,
+        images: data.images,
+        maxOutputTokens: 400,
+        thinkingEffort: "none",
+        schemaName: "food_gate",
+        schema: gateSchema,
+      });
+
+      const gateRaw = JSON.parse(stripCodeFence(gateContent)) as {
+        isFoodLabel?: unknown;
+        note?: unknown;
+      };
+      // Default to proceeding with the full analysis unless the gate
+      // explicitly said false — a parsing hiccup on this cheap classifier
+      // should never block the app's core purpose of analysing a real label.
+      const isFoodLabel = gateRaw.isFoodLabel !== false;
+      if (!isFoodLabel) {
+        return neutralNonFoodResult(typeof gateRaw.note === "string" ? gateRaw.note : "");
+      }
+
+      // Stage 2: full audit, only reached for confirmed food photos.
+      const content = await callAi(provider, {
+        system: SYSTEM,
+        userText: `Audit this packaged food using ${data.images.length} photo(s) of the same product. Transcribe the panel first, normalise to per 100g, then score. Return JSON only.`,
+        images: data.images,
+        maxOutputTokens: 8192,
+        thinkingEffort: "light",
+        schemaName: "label_audit",
+        schema,
+      });
+
+      const parsed = JSON.parse(stripCodeFence(content)) as AnalysisResult;
+      parsed.isFoodLabel = true;
+      parsed.pcRatio = Math.max(0, Math.min(2, Number(parsed.pcRatio) || 0));
+      parsed.trustScore = Math.max(0, Math.min(100, Math.round(Number(parsed.trustScore) || 0)));
+      if (!["low", "medium", "high"].includes(parsed.confidence)) parsed.confidence = "medium";
+      if (!Array.isArray(parsed.legibility)) parsed.legibility = [];
+      parsed.ingredients = Array.isArray(parsed.ingredients)
+        ? parsed.ingredients.filter((i) => typeof i === "string")
+        : [];
+      if (!Array.isArray(parsed.claims)) parsed.claims = [];
+      if (!Array.isArray(parsed.redFlags)) parsed.redFlags = [];
+      if (!Array.isArray(parsed.greenFlags)) parsed.greenFlags = [];
+      if (!["healthy", "moderate", "unhealthy"].includes(parsed.verdict))
+        parsed.verdict = "moderate";
+      parsed.productName =
+        typeof parsed.productName === "string" ? parsed.productName : "Unknown product";
+      parsed.category = typeof parsed.category === "string" ? parsed.category : "";
+      parsed.summary = typeof parsed.summary === "string" ? parsed.summary : "";
+      parsed.pcExplanation = typeof parsed.pcExplanation === "string" ? parsed.pcExplanation : "";
+      parsed.trustExplanation =
+        typeof parsed.trustExplanation === "string" ? parsed.trustExplanation : "";
+      parsed.confidenceExplanation =
+        typeof parsed.confidenceExplanation === "string" ? parsed.confidenceExplanation : "";
+
+      return parsed;
+    } catch (err) {
+      // Log details server-side only; never echo provider/env state to the client.
+      console.error("[analyzeLabel]", err);
+      const message = err instanceof Error ? err.message : "";
+      if (err instanceof SyntaxError) {
+        throw new Error(
+          "The scanner could not read a result from that photo. Try a clearer, closer shot of the label.",
+        );
+      }
+      if (message.startsWith("AI is not configured")) {
+        throw new Error("The scanner is not configured yet. Please try again later.");
+      }
+      throw new Error(
+        message && !/api[_ ]?key|token|secret/i.test(message)
+          ? message
+          : "The scanner ran into a problem. Please try again.",
+      );
+    }
+  });
