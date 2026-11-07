@@ -33,4 +33,3 @@ dist-ssr
 # Environment
 !.env.example
 .vercel
-config.bat
